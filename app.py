@@ -49,6 +49,13 @@ TOKEN_LENGTH_DEFAULT = 6
 EDIT_MINUTES_DEFAULT = 4
 MAX_CANDIDATE_DEFAULT = 3
 
+# All timestamps are stored internally in UTC (datetime.utcnow()) — this only
+# controls how they're *displayed* to admins/voters. Default: WIB (Western
+# Indonesia Time, UTC+7 / Asia-Jakarta). Change DISPLAY_TZ_OFFSET_HOURS to 8
+# for WITA or 9 for WIT if your institution is outside Java/Sumatra/etc.
+DISPLAY_TZ_OFFSET_HOURS = 7
+DISPLAY_TZ_LABEL = "WIB"
+
 app = Flask(__name__)
 app.secret_key = os.environ.get("DEANVOTE_SECRET_KEY", secrets.token_hex(32))
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
@@ -101,7 +108,8 @@ def init_db():
             email TEXT,
             email_sent INTEGER NOT NULL DEFAULT 0,
             email_sent_at TEXT,
-            email_error TEXT
+            email_error TEXT,
+            email_delivery TEXT DEFAULT NULL
         );
 
         CREATE TABLE IF NOT EXISTS vote (
@@ -167,6 +175,7 @@ def init_db():
         ("email_sent", "ALTER TABLE token ADD COLUMN email_sent INTEGER NOT NULL DEFAULT 0"),
         ("email_sent_at", "ALTER TABLE token ADD COLUMN email_sent_at TEXT"),
         ("email_error", "ALTER TABLE token ADD COLUMN email_error TEXT"),
+        ("email_delivery", "ALTER TABLE token ADD COLUMN email_delivery TEXT DEFAULT NULL"),
     ]:
         if col not in existing_token_cols:
             db.execute(ddl)
@@ -224,6 +233,17 @@ def parse_dt(s):
     if not s:
         return None
     return datetime.fromisoformat(s)
+
+
+def to_local_display(iso_str, fmt="%d %b %Y, %H:%M"):
+    """Convert a stored UTC ISO timestamp to a human-readable local-time string
+    (WIB by default) for display purposes only. Storage/locking logic always
+    stays in UTC — only this presentation layer shifts the clock."""
+    dt = parse_dt(iso_str)
+    if not dt:
+        return "-"
+    local_dt = dt + timedelta(hours=DISPLAY_TZ_OFFSET_HOURS)
+    return local_dt.strftime(fmt) + f" {DISPLAY_TZ_LABEL}"
 
 
 def hash_ip(ip):
@@ -535,11 +555,11 @@ VOTE_LINK_BODY = """
     <div class="w-14 h-14 seal rounded-full mx-auto mb-5"></div>
     <p class="font-mono text-xs tracking-[0.25em] text-[var(--gold)] uppercase mb-2">Verifikasi Pemilih</p>
     <h1 class="font-display text-3xl font-semibold">{{ title }}</h1>
-    <p class="text-sm text-[var(--ink-soft)] mt-2">Masukkan alamat email Anda yang terdaftar untuk langsung masuk ke halaman pemilihan — tanpa perlu isi token manual.</p>
+    <p class="text-sm text-[var(--ink-soft)] mt-1">Masukkan alamat email Anda yang terdaftar untuk langsung masuk ke halaman pemilihan — tanpa perlu isi token manual.</p>
   </div>
 
   {% if not voting_open %}
-  <div class="paper-card rounded-lg p-5 text-center text-sm text-[var(--ink-soft)] mb-6">
+  <div class="paper-card rounded-lg p-5 text-center text-sm text-[var(--ink-soft)] mt-1">
     Voting saat ini <span class="font-semibold text-[var(--red)]">ditutup</span>. Silahkan periksa kembali setelah pemilihan dibuka.
   </div>
   {% endif %}
@@ -552,7 +572,7 @@ VOTE_LINK_BODY = """
     <button type="submit" class="w-full btn-primary rounded-md py-3 font-medium">Verifikasi &amp; Masuk</button>
   </form>
 
-  <div class="text-center mt-8">
+  <div class="text-center mt-5">
     <a href="{{ url_for('submit_tokens_page') }}" class="text-xs text-[var(--ink-soft)] underline underline-offset-4">Punya token? Isi manual di sini</a>
     <span class="mx-2 text-[var(--paper-line)]">|</span>
     <a href="{{ url_for('index') }}" class="text-xs text-[var(--ink-soft)] underline underline-offset-4">Halaman depan</a>
@@ -605,7 +625,7 @@ def vote_link_verify():
         return render_vote_link_page(error="Email tidak terdaftar sebagai pemilih yang sah. Hubungi panitia pemilihan jika Anda merasa ini keliru.")
 
     new_token = generate_unique_token(db, cfg["token_length"])
-    db.execute("INSERT INTO token (token, email) VALUES (?, ?)", (new_token, email))
+    db.execute("INSERT INTO token (token, email, email_delivery) VALUES (?, ?, 'via_link')", (new_token, email))
     db.commit()
     session["voter_token"] = new_token
     log_action(new_token, "TOKEN_CREATED_VIA_LINK")
@@ -621,11 +641,11 @@ VOTE_BODY = """
   <div class="flex items-center justify-between mb-8">
     <div>
       <p class="font-mono text-xs tracking-[0.25em] text-[var(--gold)] uppercase mb-1">Token {{ token }}</p>
-      <h1 class="font-display text-2xl font-semibold">{{ title }}</h1>
+      <h1 class="font-display text-3xl font-semibold">{{ title }}</h1>
     </div>
     {% if editing %}
     <div class="text-right">
-      <p class="text-xs text-[var(--ink-soft)]">Time left to edit</p>
+      <p class="text-xs text-[var(--ink-soft)]">Time left for editing</p>
       <p id="countdown" class="font-mono text-lg font-semibold text-[var(--red)]">--:--</p>
     </div>
     {% endif %}
@@ -652,7 +672,7 @@ VOTE_BODY = """
       {% endfor %}
     </div>
     <button type="submit" class="w-full btn-gold rounded-md py-3 font-medium">
-      {{ "Confirm & Lock My Final Ballot" if editing else "Submit Ballot" }}
+      {{ "Confirm & Lock My Final Choice" if editing else "Submit" }}
     </button>
     <input type="hidden" name="finalize" id="finalizeInput" value="0">
   </form>
@@ -725,7 +745,7 @@ def vote_page():
     locked = sync_token_lock_state(db, row)
     if locked:
         session.pop("voter_token", None)
-        return render_submit_tokens_page(error="Jendela pengeditan token ini telah kadaluwarsa dan pemunugtan suara terkunci .")
+        return render_submit_tokens_page(error="Jendela pengeditan token ini telah kadaluwarsa dan pemungutan suara terkunci .")
 
     candidates = db.execute("SELECT * FROM candidate ORDER BY id").fetchall()
     selected = []
@@ -748,13 +768,13 @@ DONE_BODY = """
 <div class="max-w-md mx-auto px-6 py-20 text-center">
   <div class="w-16 h-16 seal rounded-full mx-auto mb-6 flex items-center justify-center text-white font-display text-2xl">✓</div>
   {% if locked %}
-  <h1 class="font-display text-2xl font-semibold mb-3">Pemungutan Suara Di Finalisasi &amp; Dikunci</h1>
+  <h1 class="font-display text-2xl font-semibold mb-5">Pemungutan Suara Di Finalisasi &amp; Dikunci</h1>
   <p class="text-sm text-[var(--ink-soft)] mb-2">Suara anda telah direkam secara anonim dan sekarang telah dikunci secara permanen.</p>
   <p class="text-sm text-[var(--ink-soft)] mb-8">Token ini tidak dapat digunakan lagi untuk memilih atau membuat perubahan. Terima kasih telah berpartisipasi.</p>
   {% else %}
   <h1 class="font-display text-2xl font-semibold mb-3">Suara Tercatat</h1>
   <p class="text-sm text-[var(--ink-soft)] mb-2">Suara anda telah dicatat secara anonim.</p>
-  <p class="text-sm text-[var(--ink-soft)] mb-8">Anda masih dapat mengedit pilihan anda dengan token yang sama hingga <strong>{{ expire_at }}</strong> UTC.</p>
+  <p class="text-sm text-[var(--ink-soft)] mb-10">Anda masih dapat mengedit pilihan anda dengan token yang sama hingga <strong>{{ expire_at }}</strong>.</p>
   <a href="{{ url_for('vote_page') }}" class="inline-block btn-primary rounded-md px-6 py-3 text-sm font-medium">Tinjau / Edit Pilihan</a>
   {% endif %}
   <div class="mt-6"><a href="{{ url_for('results') }}" class="text-xs underline text-[var(--ink-soft)]">View live results</a></div>
@@ -826,7 +846,7 @@ def submit_vote():
     if locked_now:
         session.pop("voter_token", None)
 
-    body = render_template_string(DONE_BODY, expire_at=expire_at, locked=locked_now)
+    body = render_template_string(DONE_BODY, expire_at=to_local_display(expire_at), locked=locked_now)
     return render_page("Suara Tercatat", body)
 
 
@@ -1044,9 +1064,15 @@ def api_candidate():
 def api_token():
     db = get_db()
     rows = db.execute(
-        "SELECT id, token, used, locked, used_at, expire_at, email, email_sent, email_error FROM token ORDER BY id"
+        "SELECT id, token, used, locked, used_at, expire_at, email, email_sent, email_error, email_delivery FROM token ORDER BY id"
     ).fetchall()
-    return jsonify([dict(r) for r in rows])
+    result = []
+    for r in rows:
+        d = dict(r)
+        d["used_at_display"] = to_local_display(r["used_at"])
+        d["expire_at_display"] = to_local_display(r["expire_at"])
+        result.append(d)
+    return jsonify(result)
 
 
 # ---------------------------------------------------------------------------
@@ -1547,8 +1573,10 @@ ADMIN_TOKENS_INNER = """
           <td class="py-2 pr-4 text-xs">
             {% if t.email %}
               {{ t.email }}
-              {% if t.email_sent %}<span class="badge-open px-2 py-0.5 rounded-full text-xs ml-1">Terkirim</span>
-              {% else %}<span class="badge-closed px-2 py-0.5 rounded-full text-xs ml-1" title="{{ t.email_error or '' }}">Gagal</span>{% endif %}
+              {% if t.email_delivery == 'sent' %}<span class="badge-open px-2 py-0.5 rounded-full text-xs ml-1">Terkirim</span>
+              {% elif t.email_delivery == 'failed' %}<span class="badge-closed px-2 py-0.5 rounded-full text-xs ml-1" title="{{ t.email_error or '' }}">Gagal</span>
+              {% elif t.email_delivery == 'via_link' %}<span class="bg-[var(--paper-line)] text-[var(--ink-soft)] px-2 py-0.5 rounded-full text-xs ml-1" title="Token dibuat otomatis saat pemilih verifikasi email lewat /vote-link, bukan hasil kirim email">Via Link</span>
+              {% endif %}
             {% else %}<span class="text-[var(--ink-soft)]">-</span>{% endif %}
           </td>
           <td class="py-2 pr-4">
@@ -1556,8 +1584,8 @@ ADMIN_TOKENS_INNER = """
             {% elif t.used %}<span class="badge-open px-2 py-0.5 rounded-full text-xs">Telah memilih (dapat diedit)</span>
             {% else %}<span class="text-[var(--ink-soft)]">Belum digunakan</span>{% endif %}
           </td>
-          <td class="py-2 pr-4 text-[var(--ink-soft)]">{{ t.used_at or '-' }}</td>
-          <td class="py-2 pr-4 text-[var(--ink-soft)]">{{ t.expire_at or '-' }}</td>
+          <td class="py-2 pr-4 text-[var(--ink-soft)]">{{ t.used_at_display }}</td>
+          <td class="py-2 pr-4 text-[var(--ink-soft)]">{{ t.expire_at_display }}</td>
           <td class="py-2 pr-4 whitespace-nowrap">
             {% if t.email %}
             <form method="POST" action="{{ url_for('admin_token_resend', token_id=t.id) }}" class="inline">
@@ -1599,9 +1627,14 @@ ADMIN_TOKENS_INNER = """
 
   function emailCell(t){
     if (!t.email) return '<span class="text-[var(--ink-soft)]">-</span>';
-    const badge = t.email_sent
-      ? '<span class="badge-open px-2 py-0.5 rounded-full text-xs ml-1">Terkirim</span>'
-      : '<span class="badge-closed px-2 py-0.5 rounded-full text-xs ml-1" title="' + esc(t.email_error || '') + '">Gagal</span>';
+    let badge = '';
+    if (t.email_delivery === 'sent') {
+      badge = '<span class="badge-open px-2 py-0.5 rounded-full text-xs ml-1">Terkirim</span>';
+    } else if (t.email_delivery === 'failed') {
+      badge = '<span class="badge-closed px-2 py-0.5 rounded-full text-xs ml-1" title="' + esc(t.email_error || '') + '">Gagal</span>';
+    } else if (t.email_delivery === 'via_link') {
+      badge = '<span class="bg-[var(--paper-line)] text-[var(--ink-soft)] px-2 py-0.5 rounded-full text-xs ml-1" title="Token dibuat otomatis saat pemilih verifikasi email lewat /vote-link, bukan hasil kirim email">Via Link</span>';
+    }
     return esc(t.email) + badge;
   }
 
@@ -1616,8 +1649,8 @@ ADMIN_TOKENS_INNER = """
       '<td class="py-2 pr-4 font-mono">' + esc(t.token) + '</td>' +
       '<td class="py-2 pr-4 text-xs">' + emailCell(t) + '</td>' +
       '<td class="py-2 pr-4">' + statusBadge(t) + '</td>' +
-      '<td class="py-2 pr-4 text-[var(--ink-soft)]">' + esc(t.used_at || '-') + '</td>' +
-      '<td class="py-2 pr-4 text-[var(--ink-soft)]">' + esc(t.expire_at || '-') + '</td>' +
+      '<td class="py-2 pr-4 text-[var(--ink-soft)]">' + esc(t.used_at_display) + '</td>' +
+      '<td class="py-2 pr-4 text-[var(--ink-soft)]">' + esc(t.expire_at_display) + '</td>' +
       '<td class="py-2 pr-4 whitespace-nowrap">' + resendForm +
         '<form method="POST" action="/admin/tokens/' + t.id + '/delete" class="inline" onsubmit="return confirm(' + JSON.stringify(deleteMsg) + ');">' +
           '<button class="text-xs text-[var(--red)] underline ml-3">Hapus</button>' +
@@ -1670,7 +1703,13 @@ ADMIN_TOKENS_INNER = """
 def admin_tokens():
     db = get_db()
     cfg = get_config()
-    tokens = db.execute("SELECT * FROM token ORDER BY id DESC LIMIT 500").fetchall()
+    token_rows = db.execute("SELECT * FROM token ORDER BY id DESC LIMIT 500").fetchall()
+    tokens = []
+    for t in token_rows:
+        d = dict(t)
+        d["used_at_display"] = to_local_display(t["used_at"])
+        d["expire_at_display"] = to_local_display(t["expire_at"])
+        tokens.append(d)
     smtp_configured = bool(cfg["smtp_host"] and cfg["smtp_from_email"])
 
     roster_rows = db.execute("SELECT * FROM voter_roster ORDER BY id DESC LIMIT 500").fetchall()
@@ -1687,7 +1726,11 @@ def admin_tokens():
             status = "used"
         else:
             status = "unused"
-        roster.append({"id": r["id"], "email": r["email"], "added_at": r["added_at"], "token_status": status})
+        roster.append({
+            "id": r["id"], "email": r["email"],
+            "added_at": to_local_display(r["added_at"]),
+            "token_status": status,
+        })
 
     base_url = cfg["voting_url"].rstrip("/") if cfg["voting_url"] else request.host_url.rstrip("/")
     vote_link_url = base_url + url_for("vote_link_page")
@@ -1744,13 +1787,16 @@ def admin_tokens_generate_email():
             subject, text_body, html_body = build_token_email(cfg, tok, voting_url)
             send_email(cfg, addr, subject, text_body, html_body)
             db.execute(
-                "UPDATE token SET email_sent = 1, email_sent_at = ?, email_error = NULL WHERE id = ?",
+                "UPDATE token SET email_sent = 1, email_sent_at = ?, email_error = NULL, email_delivery = 'sent' WHERE id = ?",
                 (now_str(), row["id"]),
             )
             sent += 1
             log_action(tok, "TOKEN_EMAILED")
         except Exception as e:  # noqa: BLE001 - surfaced to the admin, not swallowed silently
-            db.execute("UPDATE token SET email_sent = 0, email_error = ? WHERE id = ?", (str(e)[:250], row["id"]))
+            db.execute(
+                "UPDATE token SET email_sent = 0, email_error = ?, email_delivery = 'failed' WHERE id = ?",
+                (str(e)[:250], row["id"]),
+            )
             failed += 1
         db.commit()
 
@@ -1781,14 +1827,17 @@ def admin_token_resend(token_id):
         subject, text_body, html_body = build_token_email(cfg, row["token"], voting_url)
         send_email(cfg, row["email"], subject, text_body, html_body)
         db.execute(
-            "UPDATE token SET email_sent = 1, email_sent_at = ?, email_error = NULL WHERE id = ?",
+            "UPDATE token SET email_sent = 1, email_sent_at = ?, email_error = NULL, email_delivery = 'sent' WHERE id = ?",
             (now_str(), token_id),
         )
         db.commit()
         log_action(row["token"], "TOKEN_EMAIL_RESENT")
         set_flash("ok", f"Email resent to {row['email']}.")
     except Exception as e:  # noqa: BLE001
-        db.execute("UPDATE token SET email_sent = 0, email_error = ? WHERE id = ?", (str(e)[:250], token_id))
+        db.execute(
+            "UPDATE token SET email_sent = 0, email_error = ?, email_delivery = 'failed' WHERE id = ?",
+            (str(e)[:250], token_id),
+        )
         db.commit()
         set_flash("err", f"Failed to resend: {e}")
     return redirect(url_for("admin_tokens"))
@@ -1875,12 +1924,14 @@ def admin_roster_delete(roster_id):
 @admin_required
 def admin_tokens_export():
     db = get_db()
-    rows = db.execute("SELECT token, email, email_sent, used, locked, used_at, expire_at FROM token ORDER BY id").fetchall()
+    rows = db.execute(
+        "SELECT token, email, email_sent, email_delivery, used, locked, used_at, expire_at FROM token ORDER BY id"
+    ).fetchall()
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["token", "email", "email_sent", "used", "locked", "used_at", "expire_at"])
+    writer.writerow(["token", "email", "email_sent", "email_delivery", "used", "locked", "used_at", "expire_at"])
     for r in rows:
-        writer.writerow([r["token"], r["email"] or "", r["email_sent"], r["used"], r["locked"], r["used_at"], r["expire_at"]])
+        writer.writerow([r["token"], r["email"] or "", r["email_sent"], r["email_delivery"] or "", r["used"], r["locked"], r["used_at"], r["expire_at"]])
     mem = io.BytesIO(buf.getvalue().encode())
     return send_file(mem, mimetype="text/csv", as_attachment=True, download_name="deanvote_tokens.csv")
 
@@ -1920,7 +1971,7 @@ ADMIN_AUDIT_INNER = """
   <h1 class="font-display text-2xl font-semibold">Audit Log</h1>
   <div class="flex gap-3">
     <a href="{{ url_for('admin_audit_export') }}" class="text-sm border border-[var(--ink)] rounded-md px-4 py-2">Export CSV</a>
-    <form method="POST" action="{{ url_for('admin_audit_clear') }}" onsubmit="konfirmasi kembali('Hapus SEMUA entri Audit Log secara permanen? Ini tidak bisa dibatalkan — ekspor backup CSV terlebih dahulu jika anda membutuhkannya.');">
+    <form method="POST" action="{{ url_for('admin_audit_clear') }}" onsubmit="return confirm('Hapus SEMUA entri Audit Log secara permanen? Ini tidak bisa dibatalkan — ekspor backup CSV terlebih dahulu jika anda membutuhkannya.');">
       <button class="text-sm text-[var(--red)] border border-[var(--red)] rounded-md px-4 py-2">Hapus semua Log</button>
     </form>
   </div>
@@ -1928,18 +1979,18 @@ ADMIN_AUDIT_INNER = """
 <div class="paper-card rounded-lg p-5 overflow-x-auto">
   <table class="w-full text-sm">
     <thead><tr class="text-left text-[var(--ink-soft)] border-b border-[var(--paper-line)]">
-      <th class="py-2 pr-4">Time (UTC)</th><th class="py-2 pr-4">Token</th><th class="py-2 pr-4">Action</th><th class="py-2 pr-4">IP Hash</th><th class="py-2 pr-4">Browser</th><th class="py-2 pr-4"></th>
+      <th class="py-2 pr-4">Waktu</th><th class="py-2 pr-4">Token</th><th class="py-2 pr-4">Action</th><th class="py-2 pr-4">IP Hash</th><th class="py-2 pr-4">Browser</th><th class="py-2 pr-4"></th>
     </tr></thead>
     <tbody>
     {% for a in logs %}
       <tr class="ballot-line">
-        <td class="py-2 pr-4 font-mono text-xs">{{ a.time }}</td>
+        <td class="py-2 pr-4 font-mono text-xs">{{ a.time_display }}</td>
         <td class="py-2 pr-4 font-mono">{{ a.token or '-' }}</td>
         <td class="py-2 pr-4">{{ a.action }}</td>
         <td class="py-2 pr-4 font-mono text-xs">{{ a.ip_hash }}</td>
         <td class="py-2 pr-4 text-xs text-[var(--ink-soft)]">{{ a.browser[:40] }}</td>
         <td class="py-2 pr-4">
-          <form method="POST" action="{{ url_for('admin_audit_log_delete', log_id=a.id) }}" onsubmit="konfirmasi kembali('Hapus entri log ini?');">
+          <form method="POST" action="{{ url_for('admin_audit_log_delete', log_id=a.id) }}" onsubmit="return confirm('Hapus entri log ini?');">
             <button class="text-xs text-[var(--red)] underline">Hapus</button>
           </form>
         </td>
@@ -1955,7 +2006,12 @@ ADMIN_AUDIT_INNER = """
 @admin_required
 def admin_audit():
     db = get_db()
-    logs = db.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 500").fetchall()
+    log_rows = db.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 500").fetchall()
+    logs = []
+    for a in log_rows:
+        d = dict(a)
+        d["time_display"] = to_local_display(a["time"], fmt="%d %b %Y, %H:%M:%S")
+        logs.append(d)
     inner = render_template_string(ADMIN_AUDIT_INNER, flash=flash_block(), logs=logs)
     return render_admin_page("Audit Log", "audit", inner)
 
