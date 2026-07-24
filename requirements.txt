@@ -1,0 +1,21 @@
+# DeanVote — Python dependencies
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# Everything else the app uses (sqlite3, hashlib, smtplib, ssl, csv, io, re,
+# secrets, email.mime, datetime, functools, etc.) is part of the Python
+# standard library and does not need to be installed separately.
+# Requires Python 3.9+.
+
+Flask==3.1.3
+Werkzeug==3.1.7
+
+# HTTP client used to call the UGM SSO Gateway (SSO_GATEWAY_URL) and,
+# once wired in, the SIAP UGM dosen-lookup API (SIAP_API_BASE_URL).
+requests==2.33.1
+
+# Production WSGI server — see deanvote.service / nginx.conf.example.
+# Not required for local `python app.py` testing, but required before
+# deploying for real (never use the Flask dev server in production).
+gunicorn==26.0.0

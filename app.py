@@ -415,6 +415,13 @@ BASE_LAYOUT = """
 </head>
 <body class="min-h-screen">
 {{ body|safe }}
+<script>
+  window.addEventListener('pageshow', function (event) {
+    if (event.persisted) {
+      window.location.reload();
+      }
+    });
+</script>
 </body>
 </html>
 """
